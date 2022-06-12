@@ -122,12 +122,11 @@ sentry__crashpad_backend_flush_scope(
 #if defined(SENTRY_PLATFORM_LINUX) || defined(SENTRY_PLATFORM_WINDOWS)
 #    ifdef SENTRY_PLATFORM_WINDOWS
 static bool
-sentry__crashpad_handler(EXCEPTION_POINTERS *UNUSED(ExceptionInfo))
+sentry__crashpad_handler(EXCEPTION_POINTERS *ExceptionInfo)
 {
 #    else
 static bool
-sentry__crashpad_handler(int UNUSED(signum), siginfo_t *UNUSED(info),
-    ucontext_t *UNUSED(user_context))
+sentry__crashpad_handler(int signum, siginfo_t *info, ucontext_t *user_context)
 {
     sentry__page_allocator_enable();
     sentry__enter_signal_handler();
@@ -137,27 +136,46 @@ sentry__crashpad_handler(int UNUSED(signum), siginfo_t *UNUSED(info),
     SENTRY_WITH_OPTIONS (options) {
         sentry__write_crash_marker(options);
 
-        sentry_value_t event = sentry_value_new_event();
-        if (options->before_send_func) {
+        bool capture_crash = true;
+
+        if (options->on_crash_func) {
+            sentry_ucontext_t uctx;
+#    ifdef SENTRY_PLATFORM_WINDOWS
+            uctx.exception_ptrs = *ExceptionInfo;
+#    else
+            uctx.signum = signum;
+            uctx.siginfo = info;
+            uctx.user_context = user_context;
+#    endif
+
+            SENTRY_TRACE("invoking `on_crash` hook");
+            capture_crash
+                = options->on_crash_func(&uctx, options->on_crash_data);
+        } else if (options->before_send_func) {
+            sentry_value_t event = sentry_value_new_event();
             SENTRY_TRACE("invoking `before_send` hook");
             event = options->before_send_func(
-                event, NULL, options->before_send_data);
+                event, nullptr, options->before_send_data);
+            sentry_value_decref(event);
         }
-        sentry_value_decref(event);
 
-        sentry__record_errors_on_current_session(1);
-        sentry_session_t *session = sentry__end_current_session_with_status(
-            SENTRY_SESSION_STATUS_CRASHED);
-        if (session) {
-            sentry_envelope_t *envelope = sentry__envelope_new();
-            sentry__envelope_add_session(envelope, session);
+        if (capture_crash) {
+            sentry__record_errors_on_current_session(1);
+            sentry_session_t *session = sentry__end_current_session_with_status(
+                SENTRY_SESSION_STATUS_CRASHED);
+            if (session) {
+                sentry_envelope_t *envelope = sentry__envelope_new();
+                sentry__envelope_add_session(envelope, session);
 
-            // capture the envelope with the disk transport
-            sentry_transport_t *disk_transport
-                = sentry_new_disk_transport(options->run);
-            sentry__capture_envelope(disk_transport, envelope);
-            sentry__transport_dump_queue(disk_transport, options->run);
-            sentry_transport_free(disk_transport);
+                // capture the envelope with the disk transport
+                sentry_transport_t *disk_transport
+                    = sentry_new_disk_transport(options->run);
+                sentry__capture_envelope(disk_transport, envelope);
+                sentry__transport_dump_queue(disk_transport, options->run);
+                sentry_transport_free(disk_transport);
+            }
+        } else {
+            SENTRY_TRACE("event was discarded by the `on_crash` hook");
         }
 
         sentry__transport_dump_queue(options->transport, options->run);
